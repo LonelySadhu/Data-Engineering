@@ -1,0 +1,345 @@
+
+# Создаем db в staging
+%hive
+DROP DATABASE IF EXISTS andreynovikov_staging;
+CREATE DATABASE IF NOT EXISTS andreynovikov_staging;
+
+
+
+# создаю утилитный bash-скрипт 
+%sh
+mkdir /tmp/andreynovikov/
+
+# импорт таблицы из бд mysql в hive
+scrpt="/tmp/andreynovikov/sqoopImport.sh"
+cat << EOF > $scrpt
+#!/bin/bash
+
+tabName=\$1
+dbName=\$2
+
+echo "Importing \$tabName table into database \$dbName with sqoop import..."
+
+hdfs dfs -rm -r -f -skipTrash \$tabName >sqoop_stdout.txt 2>sqoop_stderr.txt
+
+export JAVA_HOME="/usr"
+
+/usr/lib/sqoop/bin/sqoop import --connect 'jdbc:mysql://10.93.1.9/skillfactory'\\
+                                --username mysql --password arenadata --hive-import\\
+                                -m 1 --table \$tabName --hive-table "\$dbName.\$tabName"
+
+echo "Done"
+EOF
+
+chmod a+x $scrpt
+
+
+# скрипт sql-запроса к hive 
+scrpt="/tmp/andreynovikov/execHiveCmd.sh"
+cat << EOF > $scrpt
+#!/bin/bash
+
+sql_query=\$1
+
+tmp_file="/tmp/andreynovikov/sql.txt"
+
+echo "Executing Hive QL command: \$sql_query ..."
+
+echo -e "!connect jdbc:hive2://10.93.1.9:10000 hive eee;\n\$sql_query;" > \$tmp_file
+
+beeline -f \$tmp_file
+
+rm \$tmp_file
+
+echo "Done"
+EOF
+
+chmod a+x $scrpt
+
+
+# скрипт копирования файла в hdfs
+scrpt="/tmp/andreynovikov/copyToHdfs.sh"
+cat << EOF > $scrpt
+#!/bin/bash
+
+fileName=\$1
+hdfsDir=\$2
+hdfsName=\$3
+
+if [ -n "\$hdfsName" ]; then
+    echo "Copying, \$fileName, into HDFS..."
+    hdfs dfs -mkdir -p \$hdfsDir >hdfs_stdout.txt 2>hdfs_stderr.txt
+else
+    echo "Deleting \$hdfsDir from HDFS..."
+    hdfs dfs -rm -r -f -skipTrash \$hdfsDir >hdfs_stdout.txt 2>hdfs_stderr.txt
+fi
+
+if [ -z "\$hdfsName" ]; then
+    echo "Del Done"
+    exit 0
+fi
+
+hdfs dfs -put -f \$fileName "\$hdfsDir/\$hdfsName" >hdfs_stdout.txt 2>hdfs_stderr.txt
+echo "Done"
+
+EOF
+
+chmod a+x $scrpt
+
+
+# импорт таблицы cities в hdfs с помощью sqoop
+%sh
+/tmp/andreynovikov/sqoopImport.sh 'cities' 'andreynovikov_staging'
+
+
+# создаю таблицу в hive orc формат и удаляю текстовую
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.cities_orc;
+
+CREATE TABLE IF NOT EXISTS andreynovikov_staging.cities_orc
+COMMENT 'Cities'
+STORED AS ORC
+TBLPROPERTIES ('skip.header.line.count'='1') AS 
+SELECT * FROM andreynovikov_staging.cities;
+
+DROP TABLE IF EXISTS andreynovikov_staging.cities
+
+
+# копирование в hdfs csv и json файлов
+
+# создаю external table для csv файла
+
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.nobel_laureates;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS andreynovikov_staging.nobel_laureates
+(
+    year                        INT,
+    category                    STRING,
+    prize                       STRING,
+    motivation                  STRING,
+    prize_share                 STRING,
+    laureate_id                 INT,
+    laureate_type               INT,
+    full_name                   STRING,
+    bith_date                   DATE,
+    birth_city                  STRING,
+    birth_country               STRING,
+    sex                         STRING,
+    organization_name           STRING,
+    organization_city           STRING,
+    organization_country        DATE,
+    death_date                  STRING,
+    death_city                  STRING,
+    death_country               STRING
+)
+COMMENT 'Nobel Laureates'
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+LOCATION '/tmp/andreynovikov/nobel-laureates/'
+TBLPROPERTIES ('skip.header.line.count'='1')
+;
+
+# применю ранее написанный скрипт для копирования в hdfs
+%sh
+
+fileName="/home/deng/Data/nobel-laureates.csv"
+tabName="nobel-laureates"
+
+/tmp/andreynovikov/copyToHdfs.sh $fileName "/tmp/andreynovikov/"$tabName "nobel-laureates.csv"
+
+#  создаю таблицу в orc формате, удаляю текстовую
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.nobel_laureates_orc;
+
+CREATE TABLE IF NOT EXISTS andreynovikov_staging.nobel_laureates_orc
+COMMENT 'Nobel Laureates'
+STORED AS ORC AS 
+SELECT * FROM andreynovikov_staging.nobel_laureates;
+
+DROP TABLE IF EXISTS andreynovikov_staging.nobel_laureates;
+
+# удаляю файл из hdfs
+%sh
+fileName="/home/deng/Data/nobel-laureates.csv"
+tabName="nobel-laureates"
+
+/tmp/andreynovikov/copyToHdfs.sh $fileName "/tmp/andreynovikov/"$tabName
+
+
+# создаю external table для csv файла 
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.countries_of_the_world;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS andreynovikov_staging.countries_of_the_world
+(
+    country_name            STRING,
+    region_name             STRING,
+    population              INT,
+    area                    INT,
+    pop_density             FLOAT,
+    coast_line              FLOAT,
+    net_migration           FLOAT,
+    infant_mortality        FLOAT,
+    gdp                     INT,
+    literacy                FLOAT,
+    phones                  FLOAT,
+    arable                  FLOAT,
+    crops                   FLOAT,
+    other                   FLOAT,
+    climate                 INT,
+    nirthrate               FLOAT,
+    deathrate               FLOAT,
+    agriculture             FLOAT,
+    industry                FLOAT,
+    service                 FLOAT
+)
+COMMENT 'Countries of the World'
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+LOCATION '/tmp/andreynovikov/countries_of_the_world/'
+TBLPROPERTIES ('skip.header.line.count'='1');
+
+# копирую в hdfs
+%sh
+
+fileName="/home/deng/Data/countries_of_the_world.csv"
+tabName="countries_of_the_world"
+
+/tmp/andreynovikov/copyToHdfs.sh $fileName "/tmp/andreynovikov/"$tabName "countries_of_the_world.csv"
+
+
+#  создаю таблицу в orc формате, удаляю текстовую
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.countries_of_the_world_orc;
+
+CREATE TABLE IF NOT EXISTS andreynovikov_staging.countries_of_the_world_orc
+COMMENT 'Countries of the World'
+STORED AS ORC AS 
+SELECT * FROM andreynovikov_staging.countries_of_the_world;
+
+DROP TABLE IF EXISTS andreynovikov_staging.countries_of_the_world;
+
+
+# удаляю файл из hdfs
+%sh
+
+fileName="/home/deng/Data/countries_of_the_world.csv"
+tabName="countries_of_the_world"
+
+/tmp/andreynovikov/copyToHdfs.sh $fileName "/tmp/andreynovikov/"$tabName
+
+
+#Создаю external таблицы для json файлов
+
+%hive
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.continent_ext (country_code varchar(5), continent_code varchar(5))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.names_ext (country_code varchar(5), country_name varchar(255))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.iso3_ext (country_code varchar(5), country_ISO3code varchar(5))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.capital_ext (country_code varchar(5), capital varchar(255))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.currency_ext (country_code varchar(5), currency varchar(5))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+CREATE EXTERNAL TABLE if not exists andreynovikov_staging.phone_ext (country_code varchar(5), phone varchar(255))
+row format delimited
+fields terminated by ';'
+lines terminated by '\n'
+stored as textfile
+;
+
+# Преобразование и копирование в HDFS json файлов
+
+%sh
+mkdir /tmp/andreynovikov/data/
+
+%python
+import json
+import subprocess
+
+def transform(file, external_table): 
+# вводим полное имя исходного файла и директорию, на которую смотрит external таблица для этого файла
+    with open (file) as file:
+        dict=json.load(file)
+    lst=[]
+    for i in dict.keys():
+        lst.append(i+';'+dict[i])
+    with open("/tmp/andreynovikov/data/trans_file", "w") as file:
+       for  i in lst:
+            file.write(i + '\n')
+    subprocess.run(["hdfs", "dfs", "-put", "/tmp/andreynovikov/data/trans_file",
+     "/apps/hive/warehouse/andreynovikov_staging.db/"+external_table+"/file_ext.csv"])
+    subprocess.run(["rm", "-r", "/tmp/andreynovikov/data/trans_file"])
+    
+transform('/home/deng/Data/capital.json', 'capital_ext')
+transform('/home/deng/Data/continent.json', 'continent_ext')
+transform('/home/deng/Data/currency.json', 'currency_ext')
+transform('/home/deng/Data/iso3.json', 'iso3_ext')
+transform('/home/deng/Data/names.json', 'names_ext')
+transform('/home/deng/Data/phone.json', 'phone_ext')
+
+
+#Создаем managed таблицы для json файлов
+
+%hive
+CREATE TABLE andreynovikov_staging.capital stored AS ORC AS SELECT * FROM andreynovikov_staging.capital_ext;
+CREATE TABLE andreynovikov_staging.continent stored AS ORC AS SELECT * FROM andreynovikov_staging.continent_ext;
+CREATE TABLE andreynovikov_staging.currency stored AS ORC AS SELECT * FROM andreynovikov_staging.currency_ext;
+CREATE TABLE andreynovikov_staging.iso3 stored AS ORC AS SELECT * FROM andreynovikov_staging.iso3_ext;
+CREATE TABLE andreynovikov_staging.names stored AS ORC AS SELECT * FROM andreynovikov_staging.names_ext;
+CREATE TABLE andreynovikov_staging.phone stored AS ORC AS SELECT * FROM andreynovikov_staging.phone_ext;
+
+
+#Удаляем external таблицы
+
+%hive
+DROP TABLE IF EXISTS andreynovikov_staging.capital_ext purge;
+DROP TABLE IF EXISTS andreynovikov_staging.continent_ext purge;
+DROP TABLE IF EXISTS andreynovikov_staging.currency_ext purge;
+DROP TABLE IF EXISTS andreynovikov_staging.iso3_ext purge;
+DROP TABLE IF EXISTS andreynovikov_staging.names_ext purge;
+DROP TABLE IF EXISTS andreynovikov_staging.phone_ext purge;
+
+
+#Удаляем директории external таблиц в HDFS
+
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/capital_ext
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/continent_ext
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/currency_ext
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/iso3_ext
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/names_ext
+hdfs dfs -rm -r -skipTrash /apps/hive/warehouse/andreynovikov_staging.db/phone_ext
+hdfs dfs -ls /apps/hive/warehouse/khlopotin_staging.db
+
+
+#смотрим полученные таблицы в hive
+
+%hive
+USE andreynovikov_staging;
+SHOW TABLES;
