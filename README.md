@@ -1,6 +1,10 @@
-### Решаю задачи инженера данных в hdfs кластере Arenada
+### ETL в hdfs кластере Arenada
 
-#### copy_to_staging description:  
-Переносим необходимые данные в hive из таблиц mysql и датасеты в формате csv и json  
-Оригинальный код выполнен в Zeppelin ноутбуке с интерпретаторами bash, hive и python
+#### copy_to_staging description:
+1.Extracting
+- Переносим в data lake в hive хранилище из бд mysql и локальных файлов в формате csv и json  
+- код выполнен в Zeppelin ноутбуке с интерпретаторами bash, hive и python
+
+2. Transforming
+
 
