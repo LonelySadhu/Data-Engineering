@@ -5,7 +5,7 @@
 - Загружаю в data lake, в hive хранилище данные из бд mysql и локальных файлов в формате csv и json  
 - код выполнен в Zeppelin ноутбуке с интерпретаторами bash, hive и python
 
-#### spark_snowflakes.ypunb
+#### spark_snowflakes.ipynb
 2. Transforming
 - С помошью Apache Spark трансформирум данные из хранилища в снежинку для BI-аналитиков и
 в датасет для data scientist
