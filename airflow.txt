@@ -1,0 +1,1525 @@
+%sh 
+# Удаляем базу staging с чисткой HDFS
+
+hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/khlopotin_staging.db
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop database khlopotin_staging cascade;
+END_SQL
+
+
+# Даг для staging
+%sh
+rm /tmp/airflow/dags/novikov_staging.py
+cat > /tmp/airflow/dags/novikov_staging.py << EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.subdag_operator import SubDagOperator
+import datetime
+import json
+import subprocess
+
+# настройки
+
+DAG_NAME='novikov_Staging'                                          # имя дага
+sched=None                                                          # значение интервала
+stdt=datetime.datetime(2020, 9, 9)                                  # значение старта дага
+real_date=datetime.date.today()                                     # текущая дата                               
+db_name=Variable.get(DAG_NAME+"_db_name")                           # Название БД для staging
+table_cities=Variable.get(DAG_NAME+"_table_cities")                 # Название таблицы в реляционной БД
+countries_filename=Variable.get(DAG_NAME+"_countries_filename")     # Имя файла со странами . Он должен находиться в директории /home/deng/Data
+laureates_filename=Variable.get(DAG_NAME+"_laureates_filename")     # Имя файла с нобелевскими лауреатами. Он должен находиться в директории /home/deng/Data
+phone_filename=Variable.get(DAG_NAME+"_phone_filename")             # Имя файла с кодами телефонов. Он должен находиться в директории /home/deng/Data
+capital_filename=Variable.get(DAG_NAME+"_capital_filename")         # Имя файла с столицами. Он должен находиться в директории /home/deng/Data
+iso3_filename=Variable.get(DAG_NAME+"_iso3_filename")               # Имя файла с кодами стран iso3. Он должен находиться в директории /home/deng/Data
+continent_filename=Variable.get(DAG_NAME+"_continent_filename")     # Имя файла с континентами. Он должен находиться в директории /home/deng/Data
+countryName_filename=Variable.get(DAG_NAME+"_countryName_filename") # Имя файла с названиями стран. Он должен находиться в директории /home/deng/Data
+currency_filename=Variable.get(DAG_NAME+"_currency_filename")       # Имя файла с валютой. Он должен находиться в директории /home/deng/Data
+
+# создаем основной даг
+
+dag=DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stdt, catchup=False )
+
+# Удаляем старую БД
+
+dropDB_cmd="""
+hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/{0}.db
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop database {0} cascade;
+END_SQL
+""".format(db_name)
+
+dropDB=BashOperator( task_id='dropDB', bash_command=dropDB_cmd, dag=dag)
+
+# создаем, если еще не создана БД
+
+createDB_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+create database if not exists {0}
+END_SQL
+""".format(db_name)
+
+createDB=BashOperator( task_id='createDB', bash_command=createDB_cmd, dag=dag)
+
+# скупим города из реляционной таблицы
+
+sqoop_cmd="""
+hdfs dfs -rm -r -f -skipTrash /var/lib/zeppelin/novikov/cities >novikov/rm_stdout.txt 2>novikov/rm_stderr.txt
+export JAVA_HOME="/usr"
+/usr/lib/sqoop/bin/sqoop import --connect jdbc:mysql://10.93.1.9/skillfactory --username mysql --password arenadata --table {1} --hive-import -m 1 --hive-table {0}.cities_prom --target-dir /var/lib/zeppelin/novikov/cities
+""".format(db_name, table_cities)
+  
+sqoopTable=BashOperator( task_id='skoopTable', bash_command=sqoop_cmd, dag=dag)
+
+# создаем ORC таблицу для данных из реляционной БД и загружаем в нее  обновление - результат работы sqoop. Cast нужен, т.к. sqoop импортирует соответствующие колонки с типом "double". real_date - текущая дата загрузки инкремента.
+
+createCities_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+create table if not exists {0}.cities (
+    country string,
+    city string,
+    accentcity string,
+    region string,
+    population decimal(10,0),
+    latitude decimal(10,0),
+    longitude decimal(10,0)
+    )
+partitioned by (mdate date)
+stored as orc;
+
+insert into {0}.cities partition (mdate='{1}') select 
+country,
+city,
+accentcity,
+region,
+cast (population as decimal(10,0)),
+cast (latitude as decimal(10,0)),
+cast (longitude as decimal(10,0))
+from {0}.cities_prom;
+END_SQL
+""".format(db_name, real_date)
+  
+createCities=BashOperator( task_id='createCities', bash_command=createCities_cmd, dag=dag)
+
+# Удаляем временную таблицу с городами и ее директорию в HDFS
+
+dropCitiesProm_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.cities_prom purge;
+END_SQL
+
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/cities_prom
+""".format(db_name)
+
+dropCitiesProm=BashOperator( task_id='dropCitiesProm', bash_command=dropCitiesProm_cmd, dag=dag)
+
+# Импортируем в HDFS файлы csv, создаем для них внешние таблицы, создаем managed таблицы, если их нет, инсертим данные внешней таблицы в отдельную партицию managed таблицы.
+
+loadCSV_cmd="""
+hdfs dfs -mkdir /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+hdfs dfs -put /home/deng/Data/{1} /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+
+hdfs dfs -mkdir /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+hdfs dfs -put /home/deng/Data/{2} /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+CREATE EXTERNAL TABLE {0}.countries_of_the_world_ext (
+country varchar(255),
+region varchar(255),
+population int,
+area int,
+pop_density decimal(20,10),
+coastline decimal(20,10),
+net_migration decimal(20,10), 
+infant_mortality decimal(20,10),
+GDP int,
+literacy decimal(20,10),
+phones  decimal(20,10),
+arable  decimal(20,10),
+crops  decimal(20,10),
+other  decimal(20,10),
+climate  decimal(20,10),
+birthrate  decimal(20,10),
+deathrate  decimal(20,10),
+agriculture  decimal(20,10),
+industry  decimal(20,10),
+service  decimal(20,10))
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+location '/apps/hive/warehouse/{0}.db/countries_of_the_world_ext'
+tblproperties ("skip.header.line.count"="1");
+
+CREATE EXTERNAL TABLE {0}.nobel_laureates_ext (
+Year int,
+Category string,
+Prize string,
+Motivation string,
+Prize_Share string,
+Laureate_ID int,
+Laureate_Type string,
+Full_Name string,
+Birth_Date date,
+Birth_City string,
+Birth_Country string,
+Sex string,
+Organization_Name string,
+Organization_City string,
+Organization_Country string,
+Death_Date date,
+Death_City string,
+Death_Country string)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+location '/apps/hive/warehouse/{0}.db/nobel_laureates_ext'
+tblproperties ("skip.header.line.count"="1");
+
+create table if not exists {0}.countries_of_the_world (
+country varchar(255),
+region varchar(255),
+population int,
+area int,
+pop_density decimal(20,10),
+coastline decimal(20,10),
+net_migration decimal(20,10), 
+infant_mortality decimal(20,10),
+GDP int,
+literacy decimal(20,10),
+phones  decimal(20,10),
+arable  decimal(20,10),
+crops  decimal(20,10),
+other  decimal(20,10),
+climate  decimal(20,10),
+birthrate  decimal(20,10),
+deathrate  decimal(20,10),
+agriculture  decimal(20,10),
+industry  decimal(20,10),
+service  decimal(20,10)
+)
+partitioned by (mdate date)
+stored as ORC;
+
+insert into {0}.countries_of_the_world partition ( mdate='{3}') select
+country,
+region,
+cast (population as int),
+cast (area as int),
+cast (pop_density as decimal(20,10)),
+cast (coastline as decimal(20,10)),
+cast (net_migration as decimal(20,10)),
+cast (GDP as int),
+cast (literacy as decimal(20,10)),
+cast (phones as decimal(20,10)),
+cast (arable as decimal(20,10)),
+cast (crops as decimal(20,10)),
+cast (other as decimal(20,10)),
+cast (climate as decimal(20,10)),
+cast (birthrate as decimal(20,10)),
+cast (deathrate as decimal(20,10)),
+cast (agriculture as decimal(20,10)),
+cast (industry as decimal(20,10)),
+cast (service as decimal(20,10))
+from {0}.countries_of_the_world_ext;
+
+create table if not exists {0}.nobel_laureates (
+Year int,
+Category string,
+Prize string,
+Motivation string,
+Prize_Share string,
+Laureate_ID int,
+Laureate_Type string,
+Full_Name string,
+Birth_Date date,
+Birth_City string,
+Birth_Country string,
+Sex string,
+Organization_Name string,
+Organization_City string,
+Organization_Country string,
+Death_Date date,
+Death_City string,
+Death_Country string
+)
+partitioned by (mdate date)
+stored as ORC;
+
+insert into {0}.nobel_laureates partition (mdate="{3}") select
+cast (Year as int),
+Category,
+Prize,
+Motivation,
+Prize_Share,
+cast (Laureate_ID as int),
+Laureate_Type,
+Full_Name,
+cast (Birth_Date as date),
+Birth_City,
+Birth_Country,
+Sex,
+Organization_Name,
+Organization_City,
+Organization_Country,
+cast (Death_Date as date),
+Death_City,
+Death_Country
+from {0}.nobel_laureates_ext;
+END_SQL
+""".format(db_name, countries_filename, laureates_filename, real_date)
+
+loadCSV=BashOperator( task_id='loadCSV', bash_command=loadCSV_cmd, dag=dag)
+
+# Удаляем временные таблицы со странами и лауреатами и их директории в HDFS.
+
+dropCSVExt_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.countries_of_the_world_ext purge;
+drop table {0}.nobel_laureates_ext purge;
+END_SQL
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+""".format(db_name)
+
+dropCSVExt=BashOperator( task_id='dropCSVExt', bash_command=dropCSVExt_cmd, dag=dag)
+
+# Словарь соответствия имен таблиц и имен файлов для json-файлов.
+json_dict={"phone"    : phone_filename,
+           "capital"  : capital_filename,
+           "iso3"     : iso3_filename,
+           "continent": continent_filename,
+           "names"    : countryName_filename,
+           "currency" : currency_filename}
+
+# Функция для преобразования JSON-файлов
+
+def transform(file, external_table): # вводим полное имя исходного файла и директорию, на которую смотрит external таблица для этого файла
+    with open (file) as file:
+        dict=json.load(file)
+    lst=[]
+    for i in dict.keys():
+        lst.append(i+':'+dict[i])
+    with open("/tmp/novikov/trans_file", "w") as file:
+       for  i in lst:
+            file.write(i + '\n')
+    subprocess.run(["hdfs", "dfs", "-put", "/tmp/novikov/trans_file", "/apps/hive/warehouse/novikov_staging.db/"+external_table+"/file_ext.csv"])
+    subprocess.run(["rm", "-r", "/tmp/novikov/trans_file"])
+
+# субдаг для JSON-файлов.
+
+def SubdagForJSON (parent_dag_name, schedule_interval, start_date, dbName, JSONtablName, JSON_filename, real_date):
+    
+    dag=DAG('%s.%s'%(parent_dag_name, JSONtablName), schedule_interval=schedule_interval, start_date=start_date )
+    
+    # Создаем external и managed таблицы
+    
+    createTables_cmd="""
+    /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+CREATE EXTERNAL TABLE if not exists {0}.{1}_ext (country_code varchar(5), {1} varchar(255))
+row format delimited
+fields terminated by ':'
+lines terminated by '\n'
+stored as textfile;
+
+create table if not exists {0}.{1} (country_code varchar(5), {1} varchar(255))
+partitioned by (mdate date)
+stored as orc;
+END_SQL
+""".format(dbName, JSONtablName)
+
+    createTables=BashOperator( task_id='createTables', bash_command=createTables_cmd, dag=dag)
+    
+    # проебразуем json-файл
+    
+    transformJSON=PythonOperator( task_id="transformJSON", python_callable=transform, op_args=['/home/deng/Data/'+JSON_filename, JSONtablName+'_ext'], dag=dag )
+    
+    # Инсертим данные внешней таблицы в отдельную партицию managed таблицы
+    
+    insertTables_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+insert into {0}.{1} partition (mdate="{2}") select * from {0}.{1}_ext;
+END_SQL
+""".format(dbName, JSONtablName, real_date)
+    
+    insertTables=BashOperator( task_id='insertTables', bash_command=insertTables_cmd, dag=dag)
+    
+    # Удаляем временнню таблицу и ее директорию в HDFS.
+    
+    dropJSONExt_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.{1}_ext purge;
+END_SQL
+
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/{1}_ext
+""".format(dbName, JSONtablName, real_date)
+
+    dropJSONExt=BashOperator( task_id='dropJSONExt', bash_command=dropJSONExt_cmd, dag=dag)
+
+    createTables >> transformJSON >> insertTables >> dropJSONExt
+    
+    return dag
+
+dropDB >> createDB >> sqoopTable >> createCities >> dropCitiesProm >> loadCSV >> dropCSVExt
+
+for i in json_dict:
+    sub_dag=SubDagOperator( subdag=SubdagForJSON(DAG_NAME,sched,stdt,db_name,i,json_dict[i], real_date),task_id=i, dag=dag)
+    createDB >> sub_dag
+EOF
+
+
+# Удаляем базу snowflake с чисткой HDFS
+
+%sh
+hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/novikov_snowflake.db
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop database novikov_snowflake cascade;
+END_SQL
+
+
+
+# Даг для снежинки и датасета
+
+%sh
+rm /tmp/airflow/dags/novikov_snowflake.py
+cat > /tmp/airflow/dags/novikov_snowflake.py << EOF
+import sys
+sys.path.append('/usr/lib/spark/python')
+sys.path.append('/usr/lib/spark/python/lib/py4j-0.10.7-src.zip')
+
+import os, datetime
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as f
+from pyspark.sql.functions import *
+
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.bash_operator import BashOperator
+
+
+
+# Настройки
+
+DAG_NAME='novikov_snowflake_and_dataset'                          # имя дага
+sched=None                                                          # значение интервала
+stdt=datetime.datetime(2020, 5, 6)                                  # значение старта дага
+db_name=Variable.get(DAG_NAME+"_db_name")                           # Название БД для снежинки и датасета
+actual_date=Variable.get(DAG_NAME+"_actual_date")                   # Дата для выбора обновлений (партиций) из таблиц в staging
+staging=Variable.get(DAG_NAME+"_db_name_staging")                   # Имя БД - staging
+
+# Меняем в актуальной дате "-" на "_", чтобы можно было ее вписать в имя таблицы.
+actual_date_mod=''
+for i in actual_date:
+    if i!='-':
+        actual_date_mod+=i
+    else:
+        i='_'
+        actual_date_mod+=i
+
+# создаем, если еще не создана БД и таблицы в ней
+
+# Удаляем старую снежинку и датасет
+
+dropDB_cmd="""
+hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/{0}.db
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop database {0} cascade;
+END_SQL
+""".format(db_name)
+
+# создаем новую БД и таблицы в ней
+
+createDB_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+
+create database if not exists {0};
+
+create table if not exists {0}.laureates_version_date_{1} (
+                                 unique_laureate_id bigint,
+                                 year int,
+                                 prize string,
+                                 motivation string,
+                                 prize_share string,
+                                 laureate_id int,
+                                 laureate_type string,
+                                 full_name string,
+                                 sex string,
+                                 primary key (unique_laureate_id) DISABLE NOVALIDATE)
+partitioned by (category string)
+stored as orc;
+
+create table if not exists {0}.cities_version_date_{1} (
+    city string,
+    accentcity  string,
+    population decimal(10,0),
+    latitude decimal(10,0),
+    longitude decimal(10,0),
+    country_id string,
+    id bigint,
+    primary key (id) DISABLE NOVALIDATE)
+partitioned by (region string)
+stored as orc;
+
+create table if not exists {0}.countries_version_date_{1} (
+    country string,
+    population int,
+    area int,
+    pop_density decimal(20,10),
+    coastline decimal(20,10),
+    net_migration decimal(20,10),
+    infant_mortality decimal(20,10),
+    gdp int,
+    literacy decimal(20,10),
+    phones decimal(20,10),
+    arable decimal(20,10),
+    crops decimal(20,10),
+    other decimal(20,10),
+    climate decimal(20,10),
+    birthrate decimal(20,10),
+    deathrate decimal(20,10),
+    agriculture decimal(20,10),
+    industry decimal(20,10),
+    service decimal(20,10),
+    country_code string,
+    iso3 string,
+    continent string,
+    capital string,
+    currency string,
+    phone string,
+    id bigint,
+    primary key (id) DISABLE NOVALIDATE)
+partitioned by (region string)
+stored as orc;
+
+create table if not exists {0}.death_version_date_{1} (
+    death_id bigint,
+    unique_laureate_id bigint,
+    death_date date,
+    death_city string,
+    death_country string,
+    death_country_id bigint,
+    death_city_id bigint,
+    primary key (death_id) DISABLE NOVALIDATE,
+    constraint fk foreign key (unique_laureate_id) references {0}.laureates_version_date_{1}(unique_laureate_id) DISABLE NOVALIDATE,
+    constraint fc foreign key (death_country_id) references {0}.countries_version_date_{1}(id) DISABLE NOVALIDATE,
+    constraint fg foreign key (death_city_id) references {0}.cities_version_date_{1}(id) DISABLE NOVALIDATE)
+stored as orc;
+
+create table if not exists {0}.organization_version_date_{1} (
+    organization_id bigint,
+    unique_laureate_id bigint,
+    organization_name string,
+    organization_city string,
+    organization_country string,
+    organization_country_id bigint,
+    organization_city_id bigint,
+    primary key (organization_id) DISABLE NOVALIDATE,
+    constraint fh foreign key (unique_laureate_id) references {0}.laureates_version_date_{1} (unique_laureate_id) DISABLE NOVALIDATE,
+    constraint fj foreign key (organization_country_id) references {0}.countries_version_date_{1} (id) DISABLE NOVALIDATE,
+    constraint fl foreign key (organization_city_id) references {0}.cities_version_date_{1} (id) DISABLE NOVALIDATE)
+stored as orc;
+
+create table if not exists {0}.birth_version_date_{1} (
+    birth_id bigint,
+    unique_laureate_id bigint,
+    birth_date date,
+    birth_city string,
+    birth_country string,
+    birth_country_id bigint,
+    birth_city_id bigint,
+    primary key (birth_id) DISABLE NOVALIDATE,
+    constraint fw foreign key (unique_laureate_id) references {0}.laureates_version_date_{1} (unique_laureate_id) DISABLE NOVALIDATE,
+    constraint fq foreign key (birth_country_id) references {0}.countries_version_date_{1} (id) DISABLE NOVALIDATE,
+    constraint fe foreign key (birth_city_id) references {0}.cities_version_date_{1} (id) DISABLE NOVALIDATE)
+stored as orc;
+
+create table if not exists {0}.dataset_version_date_{1} (
+               unique_laureate_id bigint,
+               year int,
+               prize string,
+               motivation string,
+               prize_share string,
+               laureate_id int,
+               laureate_type string,
+               full_name string,
+               sex string,
+               organization_name string,
+               organization_city string,
+               organization_city_accentcity string,
+               organization_city_region string,
+               organization_city_population decimal(10,0),
+               organization_city_latitude decimal(10,0),
+               organization_city_longitude decimal(10,0),
+               organization_city_country string,
+               organization_country_code string,
+               organization_country_iso3code string,
+               organization_country_continent_code string,
+               organization_country_capital string,
+               organization_country_currency string,
+               organization_country_phone string,
+               organization_country_region string,
+               organization_country_population int,
+               organization_country_area int,
+               organization_country_pop_density decimal(20,10),
+               organization_country_coastline decimal(20,10),
+               organization_country_net_migration decimal(20,10),
+               organization_country_infant_mortality decimal(20,10),
+               organization_country_gdp int,
+               organization_country_literacy decimal(20,10),
+               organization_country_phones decimal(20,10),
+               organization_country_arable decimal(20,10),
+               organization_country_crops decimal(20,10),
+               organization_country_other decimal(20,10),
+               organization_country_climate decimal(20,10),
+               organization_country_birthrate decimal(20,10),
+               organization_country_deathrate decimal(20,10),
+               organization_country_agriculture decimal(20,10),
+               organization_country_industry decimal(20,10),
+               organization_country_service decimal(20,10),
+               birth_date date,
+               birth_city  string,
+               birth_city_accentcity  string,
+               birth_city_region  string,
+               birth_city_population decimal(10,0),
+               birth_city_latitude decimal(10,0),
+               birth_city_longitude decimal(10,0),
+               birth_city_country string,
+               birth_country_code string,
+               birth_country_iso3code string,
+               birth_country_continent_code string,
+               birth_country_capital string,
+               birth_country_currency string,
+               birth_country_phone string,
+               birth_country_region string,
+               birth_country_population int,
+               birth_country_area int,
+               birth_country_pop_density decimal(20,10),
+               birth_country_coastline decimal(20,10),
+               birth_country_net_migration decimal(20,10),
+               birth_country_infant_mortality decimal(20,10),
+               birth_country_gdp int,
+               birth_country_literacy decimal(20,10),
+               birth_country_phones decimal(20,10),
+               birth_country_arable decimal(20,10),
+               birth_country_crops decimal(20,10),
+               birth_country_other decimal(20,10),
+               birth_country_climate decimal(20,10),
+               birth_country_birthrate decimal(20,10),
+               birth_country_deathrate decimal(20,10),
+               birth_country_agriculture decimal(20,10),
+               birth_country_industry decimal(20,10),
+               birth_country_service decimal(20,10),
+               death_date date,
+               death_city  string,
+               death_city_accentcity  string,
+               death_city_region  string,
+               death_city_population decimal(10,0),
+               death_city_latitude decimal(10,0),
+               death_city_longitude decimal(10,0),
+               death_city_country string,
+               death_country_code string,
+               death_country_iso3code string,
+               death_country_continent_code string,
+               death_country_capital string,
+               death_country_currency string,
+               death_country_phone string,
+               death_country_region string,
+               death_country_population int,
+               death_country_area int,
+               death_country_pop_density decimal(20,10),
+               death_country_coastline decimal(20,10),
+               death_country_net_migration decimal(20,10),
+               death_country_infant_mortality decimal(20,10),
+               death_country_gdp int,
+               death_country_literacy decimal(20,10),
+               death_country_phones decimal(20,10),
+               death_country_arable decimal(20,10),
+               death_country_crops decimal(20,10),
+               death_country_other decimal(20,10),
+               death_country_climate decimal(20,10),
+               death_country_birthrate decimal(20,10),
+               death_country_deathrate decimal(20,10),
+               death_country_agriculture decimal(20,10),
+               death_country_industry decimal(20,10),
+               death_country_service decimal(20,10),
+               primary key (unique_laureate_id) DISABLE NOVALIDATE)
+partitioned by (category string)
+stored as orc;
+END_SQL
+""".format(db_name, actual_date_mod)
+
+def doSnowflakeAndDS_cmd(staging, actual_date, actual_date_mod):
+    os.environ["JAVA_HOME"] = "/usr"
+    os.environ["PYSPARK_PYTHON"] = "/usr/bin/python3"
+    os.environ["PYSPARK_DRIVER_PYTHON"] = "python3"
+    os.environ["PYSPARK_SUBMIT_ARGS"] = """--driver-class-path /usr/share/java/mysql-connector-java.jar --jars /usr/share/java/mysql-connector-java.jar pyspark-shell"""
+    spark = SparkSession.builder.master("yarn-client").appName("spark_airflow").config("hive.metastore.uris", "thrift://10.93.1.9:9083").enableHiveSupport().getOrCreate()
+
+    # Присваеваем переменные исходным таблицам из staging
+    # Для создания снежинки и датасета в sparke берем данные из партиций с актуальной датой ('actual_date') для стран, городов, json-айлов, а таблицу с лауреатами берем полностью.
+    countries_of_the_world=spark.sql("select * from "+staging+".countries_of_the_world where mdate='"+actual_date+"'")
+    capital=spark.sql("select * from "+staging+".capital where mdate='"+actual_date+"'")
+    continent=spark.sql("select * from "+staging+".continent where mdate='"+actual_date+"'")
+    currency=spark.sql("select * from "+staging+".currency where mdate='"+actual_date+"'")
+    iso3=spark.sql("select * from "+staging+".iso3 where mdate='"+actual_date+"'")
+    names=spark.sql("select * from "+staging+".names where mdate='"+actual_date+"'")
+    phone=spark.sql("select * from "+staging+".phone where mdate='"+actual_date+"'")
+    cities=spark.sql("select * from "+staging+".cities where mdate='"+actual_date+"'")
+    nobel_laureates=spark.sql("select * from "+staging+".nobel_laureates")
+
+    #Соединяем данные из json-файлов в таблицу names_mod
+
+    joinExp_cap = names["country_code"] == capital["country_code"]
+    joinExp_con = names["country_code"] == continent["country_code"]
+    joinExp_cur = names["country_code"] == currency["country_code"]
+    joinExp_iso = names["country_code"] == iso3["country_code"]
+    joinExp_pho = names["country_code"] == phone["country_code"]
+    joinType = "outer"
+    names_mod=names.join(iso3.select('country_code', 'iso3'), joinExp_iso, joinType).drop(iso3['country_code']) \
+               .join(continent.select('country_code', 'continent'), joinExp_con, joinType).drop(continent['country_code']) \
+               .join(capital.select('country_code', 'capital'), joinExp_cap, joinType).drop(capital['country_code']) \
+               .join(currency.select('country_code', 'currency'), joinExp_cur, joinType).drop(currency['country_code']) \
+               .join(phone.select('country_code', 'phone'), joinExp_pho, joinType).drop(phone['country_code']) \
+               .drop('mdate')
+               
+    #Для соединения countries_of_the_world с names_mod убираем пробелы в значениях названий стран в countries_of_the_world и заменяем '&' на 'and'.
+
+    countries_of_the_world=countries_of_the_world.withColumn("country", rtrim(countries_of_the_world['country']))
+    countries_of_the_world=countries_of_the_world.withColumn("country", ltrim(countries_of_the_world['country']))
+    countries_of_the_world=countries_of_the_world.withColumn("country", regexp_replace(countries_of_the_world['country'],'&','and'))
+    
+    #В name_mod (данные из json-файлов) 250 строк, в countries_of_the_world 227 строк. Совпадений по названиям стран - 206. Чтобы не терять данные по несовпадающим строкам делаем таблицу, где будут все строки из обеих таблиц, но с одной колонкой с названием страны, и добавляем колонку с ID.
+
+    #Делаем таблицу со всеми строками из countries_of_the_world и одной колонкой с названием страны
+
+    countries_of_the_world1=countries_of_the_world.join(names_mod, countries_of_the_world["country"] == names_mod["names"], 'left_outer').drop('names', 'mdate')
+
+    #Делаем таблицу со всеми строками из всех таблиц, затем выбираем из них строки из names_mod, которые не нашли совпадений, переименовываем в них колонку с названием страны, присоединяем получившиеся строки к countries_of_the_world1, добавляем колонку с ID, записываем результат в базу данных для снежинки.
+
+    countries_of_the_world=countries_of_the_world.join(names_mod, countries_of_the_world["country"] == names_mod["names"], "outer") \
+                                             .where(f.col('country').isNull()) \
+                                             .drop('country', 'mdate') \
+                                             .withColumnRenamed('names','country') \
+                                             .unionByName(countries_of_the_world1) \
+                                             .withColumn('ID', f.monotonically_increasing_id())
+    
+    #В cities не идентифицируется 23 тыс строк по странам с кодом стран ZR и AN. Для них оставим такое обозначение, для остальных заменим код страны на ID страны. Добавим собственный ID для городов.
+
+    cities=cities.withColumn("country", f.upper(cities.country))
+    cities_zr_an=cities.join(countries_of_the_world, cities["country"] == countries_of_the_world["country_code"], "left_anti") \
+                   .withColumnRenamed('country', 'country_ID') \
+                   .drop('mdate')
+
+    cities=cities.join(countries_of_the_world.select('ID', 'country_code'), cities["country"] == countries_of_the_world["country_code"], "inner") \
+             .drop('country_code', 'country', 'mdate') \
+             .withColumnRenamed('ID', 'country_ID') \
+             .unionByName(cities_zr_an) \
+             .withColumn('ID', f.monotonically_increasing_id())
+    
+    # Делаем названия городов и стран в "лауретах" большими буквами
+    nobel_laureates=nobel_laureates.withColumn("organization_country", f.upper(nobel_laureates.organization_country)) \
+                               .withColumn("organization_city", f.upper(nobel_laureates.organization_city)) \
+                               .withColumn("birth_country", f.upper(nobel_laureates.birth_country)) \
+                               .withColumn("birth_city", f.upper(nobel_laureates.birth_city)) \
+                               .withColumn("death_country", f.upper(nobel_laureates.death_country)) \
+                               .withColumn("death_city", f.upper(nobel_laureates.death_city))
+
+    # Соединяем города со странами
+    cities_countries=cities.withColumnRenamed('region','city_region') \
+                       .withColumnRenamed('population','population_city') \
+                       .withColumnRenamed('ID','city_id') \
+                       .join(countries_of_the_world, cities['country_ID'] == countries_of_the_world["ID"], "left_outer") \
+                       .drop('country_ID') \
+                       .withColumnRenamed('ID','country_id')
+
+    # Делаем названия городов и стран в "города+страны" большими буквами
+    cities_countries=cities_countries.withColumn("country", f.upper(cities_countries.country)) \
+                                 .withColumn("city", f.upper(cities_countries.city))
+
+    # Выбираем нужные колонки для лауреатов, id добавляем.
+    nobel_laureates=nobel_laureates.withColumn('unique_laureate_id', f.monotonically_increasing_id())
+    laureates=nobel_laureates.select('unique_laureate_id',
+                                 'year',
+                                 'category',
+                                 'prize',
+                                 'motivation',
+                                 'prize_share',
+                                 'laureate_id',
+                                 'laureate_type',
+                                 'full_name',
+                                 'sex') 
+
+    # Выбираем нужные колонки для таблицы организации, добавляем свой id, отфильтровываем пустые строки, соединяем с ID из стран мира.
+    join_exp_org = (nobel_laureates["organization_country"] == cities_countries["country"]) & (nobel_laureates["organization_city"] == cities_countries["city"])
+    organization=nobel_laureates.select(f.monotonically_increasing_id().alias('organization_id'),
+                                    'unique_laureate_id',
+                                    'organization_name',
+                                    'organization_city',
+                                    'organization_country') \
+                            .filter("organization_name > ''") \
+                            .join(cities_countries.select('country_id', 'city_id', 'city', 'country'), join_exp_org, "left_outer") \
+                            .drop('country', 'city') \
+                            .withColumnRenamed('country_id', 'organization_country_id') \
+                            .withColumnRenamed('city_id', 'organization_city_id')
+
+    # Выбираем нужные колонки для таблицы рождения, добавляем свой id, отфильтровываем пустые строки, соединяем с ID из стран мира.
+    join_exp_birth = (nobel_laureates["birth_country"] == cities_countries["country"]) & (nobel_laureates["birth_city"] == cities_countries["city"])
+    birth=nobel_laureates.select(f.monotonically_increasing_id().alias('birth_id'),
+                                    'unique_laureate_id',
+                                    'birth_date',
+                                    'birth_city',
+                                    'birth_country') \
+                            .filter("birth_date > ''") \
+                            .join(cities_countries.select('country_id', 'city_id', 'city', 'country'), join_exp_birth, "left_outer") \
+                            .drop('country', 'city') \
+                            .withColumnRenamed('country_id', 'birth_country_id') \
+                            .withColumnRenamed('city_id', 'birth_city_id')
+
+    # Выбираем нужные колонки для таблицы смерти, добавляем свой id, отфильтровываем пустые строки, соединяем с ID из стран мира.
+    join_exp_death = (nobel_laureates["death_country"] == cities_countries["country"]) & (nobel_laureates["death_city"] == cities_countries["city"])
+    death=nobel_laureates.select(f.monotonically_increasing_id().alias('death_id'),
+                                    'unique_laureate_id',
+                                    'death_date',
+                                    'death_city',
+                                    'death_country') \
+                            .filter("death_date > ''") \
+                            .join(cities_countries.select('country_id', 'city_id', 'city', 'country'), join_exp_death, "left_outer") \
+                            .drop('country', 'city') \
+                            .withColumnRenamed('country_id', 'death_country_id') \
+                            .withColumnRenamed('city_id', 'death_city_id')
+
+    # Соединяем лауретов с городами отдельно для городов/стран рождения, смерти и организации
+    join_Expr_org = (cities_countries['city']==nobel_laureates['organization_city']) & (cities_countries['country']==nobel_laureates['organization_country'])
+    join_Expr_birth = (cities_countries['city']==nobel_laureates['birth_city']) & (cities_countries['country']==nobel_laureates['birth_country'])
+    join_Expr_death = (cities_countries['city']==nobel_laureates['death_city']) & (cities_countries['country']==nobel_laureates['death_country'])
+
+    dataset=nobel_laureates.join(cities_countries, join_Expr_org, 'left_outer') \
+                       .withColumnRenamed('country','organization_city_country') \
+                       .withColumnRenamed('accentcity','organization_city_accentcity') \
+                       .withColumnRenamed('city_region','organization_city_region') \
+                       .withColumnRenamed('population_city','organization_city_population') \
+                       .withColumnRenamed('latitude','organization_city_latitude') \
+                       .withColumnRenamed('longitude','organization_city_longitude') \
+                       .withColumnRenamed('region','organization_country_region') \
+                       .withColumnRenamed('population','organization_country_population') \
+                       .withColumnRenamed('area','organization_country_area') \
+                       .withColumnRenamed('pop_density','organization_country_pop_density') \
+                       .withColumnRenamed('coastline','organization_country_coastline') \
+                       .withColumnRenamed('net_migration','organization_country_net_migration') \
+                       .withColumnRenamed('infant_mortality','organization_country_infant_mortality') \
+                       .withColumnRenamed('gdp', 'organization_country_gdp') \
+                       .withColumnRenamed('literacy','organization_country_literacy') \
+                       .withColumnRenamed('phones','organization_country_phones') \
+                       .withColumnRenamed('arable','organization_country_arable') \
+                       .withColumnRenamed('crops','organization_country_crops') \
+                       .withColumnRenamed('other','organization_country_other') \
+                       .withColumnRenamed('climate','organization_country_climate') \
+                       .withColumnRenamed('birthrate','organization_country_birthrate') \
+                       .withColumnRenamed('deathrate','organization_country_deathrate') \
+                       .withColumnRenamed('agriculture','organization_country_agriculture') \
+                       .withColumnRenamed('industry','organization_country_industry') \
+                       .withColumnRenamed('service','organization_country_service') \
+                       .withColumnRenamed('country_code','organization_country_code') \
+                       .withColumnRenamed('names','organization_country') \
+                       .withColumnRenamed('iso3','organization_country_iso3code') \
+                       .withColumnRenamed('continent','organization_country_continent_code') \
+                       .withColumnRenamed('capital','organization_country_capital') \
+                       .withColumnRenamed('currency','organization_country_currency') \
+                       .withColumnRenamed('phone','organization_country_phone') \
+                       .drop('city') \
+                       .join(cities_countries, join_Expr_birth, 'left_outer') \
+                       .withColumnRenamed('country','birth_city_country') \
+                       .withColumnRenamed('accentcity','birth_city_accentcity') \
+                       .withColumnRenamed('city_region','birth_city_region') \
+                       .withColumnRenamed('population_city','birth_city_population') \
+                       .withColumnRenamed('latitude','birth_city_latitude') \
+                       .withColumnRenamed('longitude','birth_city_longitude') \
+                       .withColumnRenamed('region','birth_country_region') \
+                       .withColumnRenamed('population','birth_country_population') \
+                       .withColumnRenamed('area','birth_country_area') \
+                       .withColumnRenamed('pop_density','birth_country_pop_density') \
+                       .withColumnRenamed('coastline','birth_country_coastline') \
+                       .withColumnRenamed('net_migration','birth_country_net_migration') \
+                       .withColumnRenamed('infant_mortality','birth_country_infant_mortality') \
+                       .withColumnRenamed('gdp', 'birth_country_gdp') \
+                       .withColumnRenamed('literacy','birth_country_literacy') \
+                       .withColumnRenamed('phones','birth_country_phones') \
+                       .withColumnRenamed('arable','birth_country_arable') \
+                       .withColumnRenamed('crops','birth_country_crops') \
+                       .withColumnRenamed('other','birth_country_other') \
+                       .withColumnRenamed('climate','birth_country_climate') \
+                       .withColumnRenamed('birthrate','birth_country_birthrate') \
+                       .withColumnRenamed('deathrate','birth_country_deathrate') \
+                       .withColumnRenamed('agriculture','birth_country_agriculture') \
+                       .withColumnRenamed('industry','birth_country_industry') \
+                       .withColumnRenamed('service','birth_country_service') \
+                       .withColumnRenamed('country_code','birth_country_code') \
+                       .withColumnRenamed('names','birth_country') \
+                       .withColumnRenamed('iso3','birth_country_iso3code') \
+                       .withColumnRenamed('continent','birth_country_continent_code') \
+                       .withColumnRenamed('capital','birth_country_capital') \
+                       .withColumnRenamed('currency','birth_country_currency') \
+                       .withColumnRenamed('phone','birth_country_phone') \
+                       .drop('city') \
+                       .join(cities_countries, join_Expr_death, 'left_outer') \
+                       .withColumnRenamed('country','death_city_country') \
+                       .withColumnRenamed('accentcity','death_city_accentcity') \
+                       .withColumnRenamed('city_region','death_city_region') \
+                       .withColumnRenamed('population_city','death_city_population') \
+                       .withColumnRenamed('latitude','death_city_latitude') \
+                       .withColumnRenamed('longitude','death_city_longitude') \
+                       .withColumnRenamed('region','death_country_region') \
+                       .withColumnRenamed('population','death_country_population') \
+                       .withColumnRenamed('area','death_country_area') \
+                       .withColumnRenamed('pop_density','death_country_pop_density') \
+                       .withColumnRenamed('coastline','death_country_coastline') \
+                       .withColumnRenamed('net_migration','death_country_net_migration') \
+                       .withColumnRenamed('infant_mortality','death_country_infant_mortality') \
+                       .withColumnRenamed('gdp', 'death_country_gdp') \
+                       .withColumnRenamed('literacy','death_country_literacy') \
+                       .withColumnRenamed('phones','death_country_phones') \
+                       .withColumnRenamed('arable','death_country_arable') \
+                       .withColumnRenamed('crops','death_country_crops') \
+                       .withColumnRenamed('other','death_country_other') \
+                       .withColumnRenamed('climate','death_country_climate') \
+                       .withColumnRenamed('birthrate','death_country_birthrate') \
+                       .withColumnRenamed('deathrate','death_country_deathrate') \
+                       .withColumnRenamed('agriculture','death_country_agriculture') \
+                       .withColumnRenamed('industry','death_country_industry') \
+                       .withColumnRenamed('service','death_country_service') \
+                       .withColumnRenamed('country_code','death_country_code') \
+                       .withColumnRenamed('names','death_country') \
+                       .withColumnRenamed('iso3','death_country_iso3code') \
+                       .withColumnRenamed('continent','death_country_continent_code') \
+                       .withColumnRenamed('capital','death_country_capital') \
+                       .withColumnRenamed('currency','death_country_currency') \
+                       .withColumnRenamed('phone','death_country_phone') \
+                       .drop('city') \
+                       .drop('mdate')
+ 
+
+    spark.sql('set hive.exec.dynamic.partition.mode=nonstrict')
+    countries_of_the_world.select('country',
+                              'population',
+                              'area',
+                              'pop_density',
+                              'coastline',
+                              'net_migration',
+                              'infant_mortality',
+                              'gdp',
+                              'literacy',
+                              'phones',
+                              'arable',
+                              'crops',
+                              'other',
+                              'climate',
+                              'birthrate',
+                              'deathrate',
+                              'agriculture',
+                              'industry',
+                              'service',
+                              'country_code',
+                              'iso3',
+                              'continent',
+                              'capital',
+                              'currency',
+                              'phone',
+                              'id',
+                              'region') \
+                      .write.format("orc") \
+                      .mode('append') \
+                      .option("compression","zlib") \
+                      .insertInto(db_name+".countries_version_date_"+actual_date_mod)
+
+    cities.select('city',
+              'accentcity',
+              'population',
+              'latitude',
+              'longitude',
+              'country_id',
+              'id',
+              'region') \
+        .write.format("orc") \
+        .mode('append') \
+        .option("compression","zlib") \
+        .insertInto(db_name+".cities_version_date_"+actual_date_mod)
+
+    laureates.select('unique_laureate_id',
+                 'year',
+                 'prize',
+                 'motivation',
+                 'prize_share',
+                 'laureate_id',
+                 'laureate_type',
+                 'full_name',
+                 'sex',
+                 'category') \
+         .write.format("orc") \
+         .mode('append') \
+         .option("compression","zlib") \
+         .insertInto(db_name+".laureates_version_date_"+actual_date_mod)
+
+    organization.select('organization_id',
+                    'unique_laureate_id',
+                    'organization_name',
+                    'organization_city',
+                    'organization_country',
+                    'organization_country_id',
+                    'organization_city_id') \
+            .write.format("orc") \
+            .mode('append') \
+            .option("compression","zlib") \
+            .insertInto(db_name+".organization_version_date_"+actual_date_mod)
+
+    birth.select('birth_id',
+             'unique_laureate_id',
+             'birth_date',
+             'birth_city',
+             'birth_country',
+             'birth_country_id',
+             'birth_city_id') \
+     .write.format("orc") \
+     .mode('append') \
+     .option("compression","zlib") \
+     .insertInto(db_name+".birth_version_date_"+actual_date_mod)
+
+    death.select('death_id',
+             'unique_laureate_id',
+             'death_date',
+             'death_city',
+             'death_country',
+             'death_country_id',
+             'death_city_id') \
+     .write.format("orc") \
+     .mode('append') \
+     .option("compression","zlib") \
+     .insertInto("khlopotin_snowflake.death_version_date_"+actual_date_mod)
+
+    dataset.select('unique_laureate_id',
+               'year',
+               'prize',
+               'motivation',
+               'prize_share',
+               'laureate_id',
+               'laureate_type',
+               'full_name',
+               'sex',
+               'organization_name',
+               'organization_city',
+               'organization_city_accentcity',
+               'organization_city_region',
+               'organization_city_population',
+               'organization_city_latitude',
+               'organization_city_longitude',
+               'organization_city_country',
+               'organization_country_code',
+               'organization_country_iso3code',
+               'organization_country_continent_code',
+               'organization_country_capital',
+               'organization_country_currency',
+               'organization_country_phone',
+               'organization_country_region',
+               'organization_country_population',
+               'organization_country_area',
+               'organization_country_pop_density',
+               'organization_country_coastline',
+               'organization_country_net_migration',
+               'organization_country_infant_mortality',
+               'organization_country_gdp',
+               'organization_country_literacy',
+               'organization_country_phones',
+               'organization_country_arable',
+               'organization_country_crops',
+               'organization_country_other',
+               'organization_country_climate',
+               'organization_country_birthrate',
+               'organization_country_deathrate',
+               'organization_country_agriculture',
+               'organization_country_industry',
+               'organization_country_service',
+               'birth_date',
+               'birth_city',
+               'birth_city_accentcity',
+               'birth_city_region',
+               'birth_city_population',
+               'birth_city_latitude',
+               'birth_city_longitude',
+               'birth_city_country',
+               'birth_country_code',
+               'birth_country_iso3code',
+               'birth_country_continent_code',
+               'birth_country_capital',
+               'birth_country_currency',
+               'birth_country_phone',
+               'birth_country_region',
+               'birth_country_population',
+               'birth_country_area',
+               'birth_country_pop_density',
+               'birth_country_coastline',
+               'birth_country_net_migration',
+               'birth_country_infant_mortality',
+               'birth_country_gdp',
+               'birth_country_literacy',
+               'birth_country_phones',
+               'birth_country_arable',
+               'birth_country_crops',
+               'birth_country_other',
+               'birth_country_climate',
+               'birth_country_birthrate',
+               'birth_country_deathrate',
+               'birth_country_agriculture',
+               'birth_country_industry',
+               'birth_country_service',
+               'death_date',
+               'death_city',
+               'death_city_accentcity',
+               'death_city_region',
+               'death_city_population',
+               'death_city_latitude',
+               'death_city_longitude',
+               'death_city_country',
+               'death_country_code',
+               'death_country_iso3code',
+               'death_country_continent_code',
+               'death_country_capital',
+               'death_country_currency',
+               'death_country_phone',
+               'death_country_region',
+               'death_country_population',
+               'death_country_area',
+               'death_country_pop_density',
+               'death_country_coastline',
+               'death_country_net_migration',
+               'death_country_infant_mortality',
+               'death_country_gdp',
+               'death_country_literacy',
+               'death_country_phones',
+               'death_country_arable',
+               'death_country_crops',
+               'death_country_other',
+               'death_country_climate',
+               'death_country_birthrate',
+               'death_country_deathrate',
+               'death_country_agriculture',
+               'death_country_industry',
+               'death_country_service',
+               'category') \
+        .write.format("orc") \
+        .mode('append') \
+        .option("compression","zlib") \
+        .insertInto(db_name+".dataset_version_date_"+actual_date_mod)
+        
+    spark.stop()    
+
+    
+dag = DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stdt, catchup=False )
+dropDB=BashOperator( task_id='dropDB', bash_command=dropDB_cmd, dag=dag)
+createDB=BashOperator( task_id='createDB', bash_command=createDB_cmd, dag=dag)
+doSnowflakeAndDS=PythonOperator( task_id='doSnowflakeAndDS', python_callable=doSnowflakeAndDS_cmd, op_args=[staging, actual_date, actual_date_mod], dag=dag)
+dropDB >> createDB >> doSnowflakeAndDS
+
+EOF
+
+
+# Даг для лауреатов и городов
+
+%sh
+rm /tmp/airflow/dags/novikov_lauretes_and_cities.py
+cat > /tmp/airflow/dags/novikov_lauretes_and_cities.py << EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+import datetime
+
+# настройки
+
+DAG_NAME='novikov_laureates_and_cities'                           # имя дага
+sched='@monthly'                                                    # значение интервала
+stdt=datetime.datetime(2020, 5, 1)                                  # значение старта дага
+real_date=datetime.date.today()                                     # текущая дата                               
+db_name=Variable.get(DAG_NAME+"_db_name")                           # Название БД для staging
+table_cities=Variable.get(DAG_NAME+"_table_cities")                 # Название таблицы в реляционной БД
+laureates_filename=Variable.get(DAG_NAME+"_laureates_filename")     # Имя файла с нобелевскими лауреатами. Он должен находиться в директории /home/deng/Data
+
+# создаем основной даг
+
+dag=DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stdt )
+
+# создаем, если еще не создана БД
+
+createDB_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+create database if not exists {0}
+END_SQL
+""".format(db_name)
+
+createDB=BashOperator( task_id='createDB', bash_command=createDB_cmd, dag=dag)
+
+# скупим города из реляционной таблицы
+
+sqoop_cmd="""
+hdfs dfs -rm -r -f -skipTrash /var/lib/zeppelin/novikov/cities >novikov/rm_stdout.txt 2>novikov/rm_stderr.txt
+export JAVA_HOME="/usr"
+/usr/lib/sqoop/bin/sqoop import --connect jdbc:mysql://10.93.1.9/skillfactory --username mysql --password arenadata --table {1} --hive-import -m 1 --hive-table {0}.cities_prom --target-dir /tmp/novikov/cities
+""".format(db_name, table_cities)
+  
+sqoopTable=BashOperator( task_id='skoopTable', bash_command=sqoop_cmd, dag=dag)
+
+# создаем ORC таблицу для данных из реляционной БД и загружаем в нее  обновление - результат работы sqoop. Cast нужен, т.к. sqoop импортирует соответствующие колонки с типом "double". real_date - текущая дата загрузки инкремента.
+
+createCities_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+create table if not exists {0}.cities (
+    country string,
+    city string,
+    accentcity string,
+    region string,
+    population decimal(10,0),
+    latitude decimal(10,0),
+    longitude decimal(10,0)
+    )
+partitioned by (mdate date)
+stored as orc;
+
+insert into {0}.cities partition (mdate='{1}') select 
+country,
+city,
+accentcity,
+region,
+cast (population as decimal(10,0)),
+cast (latitude as decimal(10,0)),
+cast (longitude as decimal(10,0))
+from {0}.cities_prom;
+END_SQL
+""".format(db_name, real_date)
+  
+createCities=BashOperator( task_id='createCities', bash_command=createCities_cmd, dag=dag)
+
+# Удаляем временную таблицу с городами и ее директорию в HDFS
+
+dropCitiesProm_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.cities_prom purge;
+END_SQL
+
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/cities_prom
+""".format(db_name)
+
+dropCitiesProm=BashOperator( task_id='dropCitiesProm', bash_command=dropCitiesProm_cmd, dag=dag)
+
+# Импортируем в HDFS файлы csv, создаем для них внешние таблицы, создаем managed таблицы, если их нет, инсертим данные внешней таблицы в отдельную партицию managed таблицы.
+
+loadCSV_cmd="""
+hdfs dfs -mkdir /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+hdfs dfs -put /home/deng/Data/{1} /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+
+CREATE EXTERNAL TABLE {0}.nobel_laureates_ext (
+Year int,
+Category string,
+Prize string,
+Motivation string,
+Prize_Share string,
+Laureate_ID int,
+Laureate_Type string,
+Full_Name string,
+Birth_Date date,
+Birth_City string,
+Birth_Country string,
+Sex string,
+Organization_Name string,
+Organization_City string,
+Organization_Country string,
+Death_Date date,
+Death_City string,
+Death_Country string)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+location '/apps/hive/warehouse/{0}.db/nobel_laureates_ext'
+tblproperties ("skip.header.line.count"="1");
+
+create table if not exists {0}.nobel_laureates (
+Year int,
+Category string,
+Prize string,
+Motivation string,
+Prize_Share string,
+Laureate_ID int,
+Laureate_Type string,
+Full_Name string,
+Birth_Date date,
+Birth_City string,
+Birth_Country string,
+Sex string,
+Organization_Name string,
+Organization_City string,
+Organization_Country string,
+Death_Date date,
+Death_City string,
+Death_Country string
+)
+partitioned by (mdate date)
+stored as ORC;
+
+insert into {0}.nobel_laureates partition (mdate="{2}") select
+cast (Year as int),
+Category,
+Prize,
+Motivation,
+Prize_Share,
+cast (Laureate_ID as int),
+Laureate_Type,
+Full_Name,
+cast (Birth_Date as date),
+Birth_City,
+Birth_Country,
+Sex,
+Organization_Name,
+Organization_City,
+Organization_Country,
+cast (Death_Date as date),
+Death_City,
+Death_Country
+from {0}.nobel_laureates_ext;
+END_SQL
+""".format(db_name, laureates_filename, real_date)
+
+loadCSV=BashOperator( task_id='loadCSV', bash_command=loadCSV_cmd, dag=dag)
+
+# Удаляем временные таблицы с лауреатами и их директории в HDFS.
+
+dropCSVExt_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.nobel_laureates_ext purge;
+END_SQL
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/nobel_laureates_ext
+""".format(db_name)
+
+dropCSVExt=BashOperator( task_id='dropCSVExt', bash_command=dropCSVExt_cmd, dag=dag)
+
+createDB >> sqoopTable >> createCities >> dropCitiesProm >> loadCSV >> dropCSVExt
+EOF
+
+
+# Даг для стран
+
+%sh
+rm /tmp/airflow/dags/novikov_countries.py
+cat > /tmp/airflow/dags/novikov_countries.py << EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.subdag_operator import SubDagOperator
+import datetime
+import json
+import subprocess
+
+# настройки
+
+DAG_NAME='novikov_countries'                                        # имя дага
+sched='0 0 1 */3 *'                                                  # значение интервала
+stdt=datetime.datetime(2020, 5, 1)                                  # значение старта дага
+real_date=datetime.date.today()                                     # текущая дата                               
+db_name=Variable.get(DAG_NAME+"_db_name")                           # Название БД для staging
+countries_filename=Variable.get(DAG_NAME+"_countries_filename")     # Имя файла со странами . Он должен находиться в директории /home/deng/Data
+phone_filename=Variable.get(DAG_NAME+"_phone_filename")             # Имя файла с кодами телефонов. Он должен находиться в директории /home/deng/Data
+capital_filename=Variable.get(DAG_NAME+"_capital_filename")         # Имя файла с столицами. Он должен находиться в директории /home/deng/Data
+iso3_filename=Variable.get(DAG_NAME+"_iso3_filename")               # Имя файла с кодами стран iso3. Он должен находиться в директории /home/deng/Data
+continent_filename=Variable.get(DAG_NAME+"_continent_filename")     # Имя файла с континентами. Он должен находиться в директории /home/deng/Data
+countryName_filename=Variable.get(DAG_NAME+"_countryName_filename") # Имя файла с названиями стран. Он должен находиться в директории /home/deng/Data
+currency_filename=Variable.get(DAG_NAME+"_currency_filename")       # Имя файла с валютой. Он должен находиться в директории /home/deng/Data
+
+# создаем основной даг
+
+dag=DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stdt )
+
+# создаем, если еще не создана БД
+
+createDB_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+create database if not exists {0}
+END_SQL
+""".format(db_name)
+
+createDB=BashOperator( task_id='createDB', bash_command=createDB_cmd, dag=dag)
+
+# Импортируем в HDFS файлы csv, создаем для них внешние таблицы, создаем managed таблицы, если их нет, инсертим данные внешней таблицы в отдельную партицию managed таблицы.
+
+loadCSV_cmd="""
+hdfs dfs -mkdir /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+hdfs dfs -put /home/deng/Data/{1} /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+CREATE EXTERNAL TABLE {0}.countries_of_the_world_ext (
+country varchar(255),
+region varchar(255),
+population int,
+area int,
+pop_density decimal(20,10),
+coastline decimal(20,10),
+net_migration decimal(20,10), 
+infant_mortality decimal(20,10),
+GDP int,
+literacy decimal(20,10),
+phones  decimal(20,10),
+arable  decimal(20,10),
+crops  decimal(20,10),
+other  decimal(20,10),
+climate  decimal(20,10),
+birthrate  decimal(20,10),
+deathrate  decimal(20,10),
+agriculture  decimal(20,10),
+industry  decimal(20,10),
+service  decimal(20,10))
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+location '/apps/hive/warehouse/{0}.db/countries_of_the_world_ext'
+tblproperties ("skip.header.line.count"="1");
+
+create table if not exists {0}.countries_of_the_world (
+country varchar(255),
+region varchar(255),
+population int,
+area int,
+pop_density decimal(20,10),
+coastline decimal(20,10),
+net_migration decimal(20,10), 
+infant_mortality decimal(20,10),
+GDP int,
+literacy decimal(20,10),
+phones  decimal(20,10),
+arable  decimal(20,10),
+crops  decimal(20,10),
+other  decimal(20,10),
+climate  decimal(20,10),
+birthrate  decimal(20,10),
+deathrate  decimal(20,10),
+agriculture  decimal(20,10),
+industry  decimal(20,10),
+service  decimal(20,10)
+)
+partitioned by (mdate date)
+stored as ORC;
+
+insert into {0}.countries_of_the_world partition ( mdate='{2}') select
+country,
+region,
+cast (population as int),
+cast (area as int),
+cast (pop_density as decimal(20,10)),
+cast (coastline as decimal(20,10)),
+cast (net_migration as decimal(20,10)),
+cast (infant_mortality as decimal(20,10)),
+cast (GDP as int),
+cast (literacy as decimal(20,10)),
+cast (phones as decimal(20,10)),
+cast (arable as decimal(20,10)),
+cast (crops as decimal(20,10)),
+cast (other as decimal(20,10)),
+cast (climate as decimal(20,10)),
+cast (birthrate as decimal(20,10)),
+cast (deathrate as decimal(20,10)),
+cast (agriculture as decimal(20,10)),
+cast (industry as decimal(20,10)),
+cast (service as decimal(20,10))
+from {0}.countries_of_the_world_ext;
+END_SQL
+""".format(db_name, countries_filename, real_date)
+
+loadCSV=BashOperator( task_id='loadCSV', bash_command=loadCSV_cmd, dag=dag)
+
+# Удаляем временные таблицы со странами и лауреатами и их директории в HDFS.
+
+dropCSVExt_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.countries_of_the_world_ext purge;
+END_SQL
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/countries_of_the_world_ext
+""".format(db_name)
+
+dropCSVExt=BashOperator( task_id='dropCSVExt', bash_command=dropCSVExt_cmd, dag=dag)
+
+# Словарь соответствия имен таблиц и имен файлов для json-файлов.
+json_dict={"phone"    : phone_filename,
+           "capital"  : capital_filename,
+           "iso3"     : iso3_filename,
+           "continent": continent_filename,
+           "names"    : countryName_filename,
+           "currency" : currency_filename}
+
+# Функция для преобразования JSON-файлов
+
+def transform(file, external_table): # вводим полное имя исходного файла и директорию, на которую смотрит external таблица для этого файла
+    with open (file) as file:
+        dict=json.load(file)
+    lst=[]
+    for i in dict.keys():
+        lst.append(i+':'+dict[i])
+    with open("/tmp/novikov/trans_file", "w") as file:
+       for  i in lst:
+            file.write(i + '\n')
+    subprocess.run(["hdfs", "dfs", "-put", "/tmp/novikov/trans_file", "/apps/hive/warehouse/novikov_staging.db/"+external_table+"/file_ext.csv"])
+    subprocess.run(["rm", "-r", "/tmp/novikov/trans_file"])
+
+# субдаг для JSON-файлов.
+
+def SubdagForJSON (parent_dag_name, schedule_interval, start_date, dbName, JSONtablName, JSON_filename, real_date):
+    
+    dag=DAG('%s.%s'%(parent_dag_name, JSONtablName), schedule_interval=schedule_interval, start_date=start_date )
+    
+    # Создаем external и managed таблицы
+    
+    createTables_cmd="""
+    /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+CREATE EXTERNAL TABLE if not exists {0}.{1}_ext (country_code varchar(5), {1} varchar(255))
+row format delimited
+fields terminated by ':'
+lines terminated by '\n'
+stored as textfile;
+
+create table if not exists {0}.{1} (country_code varchar(5), {1} varchar(255))
+partitioned by (mdate date)
+stored as orc;
+
+END_SQL
+""".format(dbName, JSONtablName)
+
+    createTables=BashOperator( task_id='createTables', bash_command=createTables_cmd, dag=dag)
+    
+    # проебразуем json-файл
+    
+    transformJSON=PythonOperator( task_id="transformJSON", python_callable=transform, op_args=['/home/deng/Data/'+JSON_filename, JSONtablName+'_ext'], dag=dag )
+    
+    # Инсертим данные внешней таблицы в отдельную партицию managed таблицы
+    
+    insertTables_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+insert into {0}.{1} partition (mdate="{2}") select * from {0}.{1}_ext;
+END_SQL
+""".format(dbName, JSONtablName, real_date)
+    
+    insertTables=BashOperator( task_id='insertTables', bash_command=insertTables_cmd, dag=dag)
+    
+    # Удаляем временнню таблицу и ее директорию в HDFS.
+    
+    dropJSONExt_cmd="""
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table {0}.{1}_ext purge;
+END_SQL
+
+hdfs dfs -rm -r -f -skipTrash /apps/hive/warehouse/{0}.db/{1}_ext
+""".format(dbName, JSONtablName, real_date)
+
+    dropJSONExt=BashOperator( task_id='dropJSONExt', bash_command=dropJSONExt_cmd, dag=dag)
+
+    createTables >> transformJSON >> insertTables >> dropJSONExt
+    
+    return dag
+
+createDB >> loadCSV >> dropCSVExt
+
+for i in json_dict:
+    sub_dag=SubDagOperator( subdag=SubdagForJSON(DAG_NAME,sched,stdt,db_name,i,json_dict[i], real_date),task_id=i, dag=dag)
+    createDB >> sub_dag    
+EOF
+
