@@ -1,9 +1,9 @@
 %sh 
 # Удаляем базу staging с чисткой HDFS
 
-hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/khlopotin_staging.db
+hdfs dfs -rm -r -skipTrash -f /apps/hive/warehouse/novikov_staging.db
 /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
-drop database khlopotin_staging cascade;
+drop database novikov_staging cascade;
 END_SQL
 
 
